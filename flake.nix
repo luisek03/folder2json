@@ -1,5 +1,5 @@
 {
-  description = "Lossless folder archiving into self-contained, AI-optimized JSON";
+  description = "folder2json - All-in-One Build Tool (Static)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
@@ -9,50 +9,77 @@
   outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
+        # 1. Native Linux Toolchain
         pkgs = import nixpkgs { inherit system; };
-      in
-      {
-        packages.default = pkgs.rustPlatform.buildRustPackage {
+
+        # 2. Windows Cross-Compilation Toolchain (MinGW-w64)
+        pkgsWindows = import nixpkgs {
+          inherit system;
+          crossSystem.config = "x86_64-w64-mingw32";
+        };
+
+        # 3. Paket-Definition für Linux (Statisch)
+        linuxPkg = pkgs.rustPlatform.buildRustPackage {
           pname = "folder2json";
           version = "1.2.0";
-
           src = ./.;
-
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-          };
-
-          nativeBuildInputs = with pkgs; [
-            pkg-config
-          ];
-
-          buildInputs = with pkgs; [
-            zstd
-          ];
-
-          # Aktiviert das Feature aus deiner Cargo.toml für den Nix-Build hallo
-          buildFeatures = [ "system-zstd" ];
-          ZSTD_SYS_USE_PKG_CONFIG = "1";
+          cargoLock.lockFile = ./Cargo.lock;
 
           meta = with pkgs.lib; {
-            description = "CLI tool to archive directories losslessly into AI-optimized JSON";
-            homepage = "https://github.com/luisek03/folder2json";
-            license = licenses.mit;
+            description = "Lossless folder archiving CLI";
             mainProgram = "folder2json";
           };
         };
 
+        # 4. Paket-Definition für Windows (Cross-Compiled Statisch)
+        windowsPkg = pkgsWindows.rustPlatform.buildRustPackage {
+          pname = "folder2json-windows";
+          version = "1.2.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
 
+          meta = with pkgs.lib; {
+            description = "Lossless folder archiving CLI (Windows)";
+            mainProgram = "folder2json.exe";
+          };
+        };
+
+      in
+      {
+        # ==========================================
+        # BUILD-ZIELE (Nix Sandbox)
+        # ==========================================
+        packages = {
+          default = linuxPkg;
+          linux = linuxPkg;
+          windows = windowsPkg;
+        };
+
+        # ==========================================
+        # APPS (Lokale Ausführung für schnelles Caching)
+        # ==========================================
+        apps = {
+          # nix run .#build-fast
+          build-fast = {
+            type = "app";
+            program = toString (pkgs.writeShellScript "build-fast" ''
+              echo "Baue lokal mit Cargo (inkl. target/ Caching, rein statisch) ..."
+              cargo build --release
+
+              echo -e "\n✅ Fertig! Schnelles, lokal gecachtes Binary liegt in:"
+              echo "   ./target/release/folder2json"
+            '');
+          };
+        };
+
+        # ==========================================
+        # ENTWICKLUNGSUMGEBUNG (nix develop)
+        # ==========================================
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [
             cargo
             rustc
-            pkg-config
           ];
-          buildInputs = with pkgs; [
-            zstd
-          ];
-          ZSTD_SYS_USE_PKG_CONFIG = "1";
         };
       }
     );
