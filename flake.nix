@@ -1,5 +1,5 @@
 {
-  description = "folder2json - All-in-One Build Tool (Static)";
+  description = "folder2json - All-in-One Build & Release Tool";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
@@ -9,16 +9,15 @@
   outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        # 1. Native Linux Toolchain
         pkgs = import nixpkgs { inherit system; };
 
-        # 2. Windows Cross-Compilation Toolchain (MinGW-w64)
+        # Windows Cross-Toolchain via MinGW-w64
         pkgsWindows = import nixpkgs {
           inherit system;
           crossSystem.config = "x86_64-w64-mingw32";
         };
 
-        # 3. Paket-Definition für Linux (Statisch)
+        # 1. Linux Binary
         linuxPkg = pkgs.rustPlatform.buildRustPackage {
           pname = "folder2json";
           version = "1.2.0";
@@ -26,60 +25,67 @@
           cargoLock.lockFile = ./Cargo.lock;
 
           meta = with pkgs.lib; {
-            description = "Lossless folder archiving CLI";
+            description = "folder2json CLI (Linux)";
             mainProgram = "folder2json";
           };
         };
 
-        # 4. Paket-Definition für Windows (Cross-Compiled Statisch)
+        # 2. Windows Binary (.exe)
         windowsPkg = pkgsWindows.rustPlatform.buildRustPackage {
           pname = "folder2json-windows";
           version = "1.2.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
+          # Stellt sicher, dass das Binary mit .exe-Endung im Store landet
+          postInstall = ''
+            if [ -f "$out/bin/folder2json" ] && [ ! -f "$out/bin/folder2json.exe" ]; then
+              mv "$out/bin/folder2json" "$out/bin/folder2json.exe"
+            fi
+          '';
+
           meta = with pkgs.lib; {
-            description = "Lossless folder archiving CLI (Windows)";
+            description = "folder2json CLI (Windows)";
             mainProgram = "folder2json.exe";
           };
         };
 
+        # 3. Gemeinsames Release-Paket (beide OS in einem Output)
+        releasePkg = pkgs.symlinkJoin {
+          name = "folder2json-all-releases";
+          paths = [ linuxPkg windowsPkg ];
+        };
+
       in
       {
-        # ==========================================
-        # BUILD-ZIELE (Nix Sandbox)
-        # ==========================================
         packages = {
           default = linuxPkg;
           linux = linuxPkg;
           windows = windowsPkg;
+          release = releasePkg;
         };
 
-        # ==========================================
-        # APPS (Lokale Ausführung für schnelles Caching)
-        # ==========================================
         apps = {
-          # nix run .#build-fast
-          build-fast = {
+          # Kopiert die fertigen Binaries als ECHTE Dateien (keine Store-Symlinks, kein root)
+          # in den Ordner ./dist-release/
+          export-release = {
             type = "app";
-            program = toString (pkgs.writeShellScript "build-fast" ''
-              echo "Baue lokal mit Cargo (inkl. target/ Caching, rein statisch) ..."
-              cargo build --release
+            program = toString (pkgs.writeShellScript "export-release" ''
+              set -e
+              TARGET_DIR="./dist-release"
+              echo "📦 Kopiere Binaries aus dem Nix-Store nach $TARGET_DIR ..."
+              mkdir -p "$TARGET_DIR"
 
-              echo -e "\n✅ Fertig! Schnelles, lokal gecachtes Binary liegt in:"
-              echo "   ./target/release/folder2json"
+              cp -f "${linuxPkg}/bin/folder2json" "$TARGET_DIR/folder2json-linux-x86_64"
+              chmod 755 "$TARGET_DIR/folder2json-linux-x86_64"
+
+              cp -f "${windowsPkg}/bin/folder2json.exe" "$TARGET_DIR/folder2json-windows-x86_64.exe"
+              chmod 755 "$TARGET_DIR/folder2json-windows-x86_64.exe"
+
+              echo -e "\n✅ Fertig! Echte Binaries liegen bereit in $TARGET_DIR:"
+              ls -lh "$TARGET_DIR"
             '');
           };
-        };
-
-        # ==========================================
-        # ENTWICKLUNGSUMGEBUNG (nix develop)
-        # ==========================================
-        devShells.default = pkgs.mkShell {
-          nativeBuildInputs = with pkgs; [
-            cargo
-            rustc
-          ];
         };
       }
     );
