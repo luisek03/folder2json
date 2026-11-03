@@ -30,7 +30,7 @@
             zstd
           ];
 
-          # Aktiviert das Feature aus deiner Cargo.toml für den Nix-Build
+          # Aktiviert das Feature aus deiner Cargo.toml für den Nix-Build hallo
           buildFeatures = [ "system-zstd" ];
           ZSTD_SYS_USE_PKG_CONFIG = "1";
 
