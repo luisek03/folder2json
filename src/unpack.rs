@@ -10,7 +10,14 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
+
+#[cfg(windows)]
+fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Result<()> {
+    // Windows unterstützt Symlinks, erfordert aber oft Admin-Rechte / Developer-Mode
+    std::os::windows::fs::symlink_file(original, link)
+}
 use std::path::{Component, Path, PathBuf};
 use std::process;
 
@@ -71,12 +78,16 @@ fn write_stream_verified<R: Read>(
     ));
 
     let mut write_and_hash = || -> Result<String, String> {
-        let f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600) // Sofort mit 0600 (nur für Besitzer les-/schreibbar) anlegen
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+
+        #[cfg(unix)]
+        options.mode(0o600); // Unter Linux/Unix sofort mit 0600 anlegen
+
+        let f = options
         .open(&tmp_path)
         .map_err(|e| format!("Konnte temporäre Datei nicht anlegen: {}", e))?;
+
         let mut writer = BufWriter::new(f);
         let mut hasher = Sha256::new();
         let mut total_written: u64 = 0;
@@ -129,17 +140,20 @@ fn write_stream_verified<R: Read>(
         }
     }
 
-    let raw_mode = mode.unwrap_or(0o644);
-    if raw_mode & !0o777 != 0 {
-        eprintln!(
-            "⚠️  SICHERHEITSHINWEIS: Spezial-Bits (SUID/SGID/Sticky: {:o}) wurden entfernt.",
-                  raw_mode
-        );
-    }
-    let safe_mode = raw_mode & 0o777;
-    if let Err(e) = fs::set_permissions(&tmp_path, Permissions::from_mode(safe_mode)) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(format!("Konnte Berechtigungen nicht setzen: {}", e));
+    #[cfg(unix)]
+    {
+        let raw_mode = mode.unwrap_or(0o644);
+        if raw_mode & !0o777 != 0 {
+            eprintln!(
+                "⚠️  SICHERHEITSHINWEIS: Spezial-Bits (SUID/SGID/Sticky: {:o}) wurden entfernt.",
+                      raw_mode
+            );
+        }
+        let safe_mode = raw_mode & 0o777;
+        if let Err(e) = fs::set_permissions(&tmp_path, Permissions::from_mode(safe_mode)) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("Konnte Berechtigungen nicht setzen: {}", e));
+        }
     }
 
     if let Err(e) = fs::rename(&tmp_path, target) {

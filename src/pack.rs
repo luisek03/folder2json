@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -125,7 +126,10 @@ fn walk_dir(
 
         let st = fs::symlink_metadata(&full)
         .map_err(|e| format!("Fehler bei lstat von '{}': {}", rel_posix, e))?;
+        #[cfg(unix)]
         let mode = st.permissions().mode() & 0o777;
+        #[cfg(windows)]
+        let mode = 0o644; // Windows nutzt Fallback-Berechtigungen
 
         let (digest, size, is_text) = analyze_file(&full)
         .map_err(|e| format!("Fehler beim Analysieren von '{}': {}", rel_posix, e))?;
