@@ -1,7 +1,7 @@
 { pkgs ? import <nixpkgs> { } }:
 
 pkgs.mkShell {
-  name = "folder-into-json-rust";
+  name = "folder2json-rust";
 
   packages = with pkgs; [
     rustc
@@ -10,7 +10,7 @@ pkgs.mkShell {
   ];
 
   shellHook = ''
-    echo "folder-into-json Rust dev shell"
+    echo "folder2json Rust dev shell"
     echo "  rustc $(rustc --version)"
     echo "  cargo $(cargo --version)"
     echo "  jq    $(jq --version)"
@@ -19,6 +19,6 @@ pkgs.mkShell {
     echo "  cargo build --release"
     echo ""
     echo "Fertige Binärdatei liegt danach unter:"
-    echo "  ./target/release/folder-into-json"
+    echo "  ./target/release/folder2json"
   '';
 }

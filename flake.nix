@@ -13,7 +13,7 @@
       in
       {
         packages.default = pkgs.rustPlatform.buildRustPackage {
-          pname = "folder-into-json";
+          pname = "folder2json";
           version = "1.2.0";
 
           src = ./.;
@@ -36,9 +36,9 @@
 
           meta = with pkgs.lib; {
             description = "CLI tool to archive directories losslessly into AI-optimized JSON";
-            homepage = "https://github.com/luisek03/folder-into-json";
+            homepage = "https://github.com/luisek03/folder2json";
             license = licenses.mit;
-            mainProgram = "folder-into-json";
+            mainProgram = "folder2json";
           };
         };
 

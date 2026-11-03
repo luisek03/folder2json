@@ -1,5 +1,5 @@
 [package]
-name = "folder-into-json"
+name = "folder2json"
 version = "1.2.0"
 edition = "2021"
 

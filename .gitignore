@@ -230,6 +230,6 @@ result
 /target/
 
 # 2. Den Pfad zur Binärdatei explizit wieder erlauben (Negation)
-!/target/release/folder-into-json
+!/target/release/folder2json
 
 

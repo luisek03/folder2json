@@ -1,4 +1,4 @@
-# folder-into-json
+# folder2json
 
 A high-performance CLI utility written in Rust to pack entire folder structures (including contents, Unix permissions, and symlinks) into a single, self-contained JSON file (`pack`) and restore them bit-exact (`unpack`).
 
@@ -9,7 +9,7 @@ Optimized specifically for **LLM context injection**, shell pipelines (Stdin/Std
 ## Project Structure
 
 ```text
-folder-into-json/
+folder2json/
 ├── Cargo.lock      # Locked Rust dependencies
 ├── Cargo.toml      # Package manifest & optional features (system-zstd)
 ├── flake.lock      # Pinned Nixpkgs flake inputs (nixos-26.05)
@@ -40,14 +40,14 @@ folder-into-json/
 Run directly without installing:
 
 ```bash
-nix run github:luisek03/folder-into-json -- --help
+nix run github:luisek03/folder2json -- --help
 ```
 
 Build the reproducible derivation:
 
 ```bash
 nix build
-# Binary is available at ./result/bin/folder-into-json
+# Binary is available at ./result/bin/folder2json
 ```
 
 Enter development shell:
@@ -64,21 +64,21 @@ nix profile install .#default
 
 ### In NixOS Configuration (`flake.nix`)
 
-Add `folder-into-json` as an input:
+Add `folder2json` as an input:
 
 ```nix
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
-    folder-into-json.url = "github:luisek03/folder-into-json";
+    folder2json.url = "github:luisek03/folder2json";
   };
 
-  outputs = { self, nixpkgs, folder-into-json, ... }@inputs: {
+  outputs = { self, nixpkgs, folder2json, ... }@inputs: {
     nixosConfigurations.<hostname> = nixpkgs.lib.nixosSystem {
       modules = [
         ({ pkgs, ... }: {
           environment.systemPackages = [
-            folder-into-json.packages.${pkgs.system}.default
+            folder2json.packages.${pkgs.system}.default
           ];
         })
       ];
@@ -91,7 +91,7 @@ Add `folder-into-json` as an input:
 
 ```bash
 cargo build --release
-# Binary is available at ./target/release/folder-into-json
+# Binary is available at ./target/release/folder2json
 ```
 
 To build dynamically against the system's `libzstd.so` using `pkg-config`:
@@ -108,29 +108,29 @@ cargo build --release --features system-zstd
 
 ```bash
 # Pack a project directory into an archive
-folder-into-json pack ./my-project archive.json -v
+folder2json pack ./my-project archive.json -v
 
 # Pack including hidden files, but excluding build artifacts
-folder-into-json pack ./src output.json -a -e target -e "*.log"
+folder2json pack ./src output.json -a -e target -e "*.log"
 
 # Pack to stdout and pipe directly into xz compression
-folder-into-json pack ./my-project - | xz > archive.json.xz
+folder2json pack ./my-project - | xz > archive.json.xz
 
 # Pack with binary compression disabled (plain Base64)
-folder-into-json pack ./my-project archive.json --no-compress
+folder2json pack ./my-project archive.json --no-compress
 ```
 
 ### Unpacking
 
 ```bash
 # Unpack JSON back into a folder with integrity verification
-folder-into-json unpack archive.json ./restored -v
+folder2json unpack archive.json ./restored -v
 
 # Unpack directly from a compressed stream via Stdin
-xz -dc archive.json.xz | folder-into-json unpack - ./restored
+xz -dc archive.json.xz | folder2json unpack - ./restored
 
 # Unpack skipping SHA-256 integrity verification
-folder-into-json unpack archive.json ./restored --no-verify
+folder2json unpack archive.json ./restored --no-verify
 ```
 
 ---

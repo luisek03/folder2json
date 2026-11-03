@@ -18,9 +18,9 @@ const B64_CHUNK: usize = 3 * 1024 * 1024;         // Vielfaches von 3 -> kein Pa
 const DEFAULT_MAX_SIZE_MIB: u64 = 512;            // Standard-Schutzlimit gegen Zstd-Bomben (512 MiB)
 const MAX_ENCODING_STEPS: usize = 2;              // Maximal ["zstd", "base64"]
 
-const REPOSITORY_URL: &str = "https://github.com/luisek03/folder-into-json";
+const REPOSITORY_URL: &str = "https://github.com/luisek03/folder2json";
 
-const AI_INSTRUCTIONS: &str = "This JSON file is a flat directory archive. For semantic analysis, inspect only entries where \"type\" is \"text\". To minimize token consumption and avoid parsing errors, strictly ignore raw values of non-plaintext entries (such as base64-encoded \"binary\" blocks). If you must extract or inspect a non-plaintext file, write an execution script to decode it on the fly, or refer the user to the native Rust CLI tool at https://github.com/luisek03/folder-into-json.";
+const AI_INSTRUCTIONS: &str = "This JSON file is a flat directory archive. For semantic analysis, inspect only entries where \"type\" is \"text\". To minimize token consumption and avoid parsing errors, strictly ignore raw values of non-plaintext entries (such as base64-encoded \"binary\" blocks). If you must extract or inspect a non-plaintext file, write an execution script to decode it on the fly, or refer the user to the native Rust CLI tool at https://github.com/luisek03/folder2json.";
 
 const SCHEMA_DESCRIPTION: &str = "Top-level metadata describes the archive, while \"files\" holds an array of file objects. Each file object defines its relative location via \"path\", POSIX permissions via \"mode\", a 16-character truncated SHA-256 \"hash\" for byte integrity, and an entry \"type\": \"text\" stores raw UTF-8 content directly in \"content\"; \"binary\" stores byte streams encoded per the \"encoding\" pipeline array (e.g. [\"zstd\", \"base64\"] or [\"base64\"]); \"symlink\" indicates a symbolic link pointing to \"target\"; \"link\" denotes an identical deduplicated file whose \"content\" references the canonical file's \"path\". To reconstruct files programmatically, resolve all \"link\" chains to their canonical source, decode the payload by processing \"encoding\" in reverse order, verify the first 16 hex chars of the reconstructed bytes against \"hash\", and write to disk. A complete Python decoder function implementing this workflow is provided in \"python_reference\".";
 
@@ -28,7 +28,7 @@ const PYTHON_REFERENCE: &str = "import json, base64, hashlib\n\ntry:\n    import
 
 #[derive(Parser)]
 #[command(
-name = "folder-into-json",
+name = "folder2json",
 author = "Luis",
 version,
 about = "Lossless folder archiving into self-contained, AI-optimized JSON.",
@@ -50,9 +50,9 @@ enum Commands {
 Outputs raw UTF-8 for plaintext files, and encoded byte streams for binary files.\n\
 Supports deduplication, automatic integrity hashing, and UNIX permission retention.\n\n\
 EXAMPLES:\n  \
-folder-into-json pack ./my-project archive.json\n  \
-folder-into-json pack ./my-project - | xz > archive.json.xz\n  \
-folder-into-json pack ./src output.json -a -e target -e '*.log'"
+folder2json pack ./my-project archive.json\n  \
+folder2json pack ./my-project - | xz > archive.json.xz\n  \
+folder2json pack ./src output.json -a -e target -e '*.log'"
     )]
     Pack {
         /// Source directory to pack
@@ -89,9 +89,9 @@ Reconstructs file hierarchy, decodes payloads, recreates symlinks,\n\
 restores exact POSIX permissions, and validates 16-character SHA-256 hashes.\n\
 Enforces strict scope validation against path traversal (../, ~/, /) and symlink escapes.\n\n\
 EXAMPLES:\n  \
-folder-into-json unpack archive.json ./restored\n  \
-xz -dc archive.json.xz | folder-into-json unpack - ./restored\n  \
-folder-into-json unpack archive.json ./restored --no-verify"
+folder2json unpack archive.json ./restored\n  \
+xz -dc archive.json.xz | folder2json unpack - ./restored\n  \
+folder2json unpack archive.json ./restored --no-verify"
     )]
     Unpack {
         /// Input JSON archive path, or '-' to read directly from stdin
