@@ -6,17 +6,21 @@ use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fs::{self, File, Permissions};
-use std::io::{self, BufWriter, Read, Write};
+use std::fs::{self, File, OpenOptions, Permissions};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process;
 
-const READ_CHUNK: usize = 1024 * 1024;            // 1 MiB Lese-Block fürs Hashen & UTF-8 Check
-const TEXT_CHUNK: usize = 1024 * 1024;            // 1 MiB beim Streaming-Output
-const B64_CHUNK: usize = 3 * 1024 * 1024;         // Vielfaches von 3 -> kein Padding-Drift
-const DEFAULT_MAX_SIZE_MIB: u64 = 512;            // Standard-Schutzlimit gegen Zstd-Bomben (512 MiB)
+const READ_CHUNK: usize = 1024 * 1024;            // 1 MiB Lese-Block fürs Hashen & Streaming
+const TEXT_CHUNK: usize = 1024 * 1024;            // 1 MiB beim Text-Streaming-Output
+const B64_ENCODE_CHUNK: usize = 48 * 1024;        // 48 KiB (Vielfaches von 3) -> 64 KiB Base64-Blöcke
+const B64_DECODE_CHUNK: usize = 64 * 1024;        // 64 KiB (Vielfaches von 4) -> 48 KiB Rohdaten-Blöcke
+const STREAM_COPY_CHUNK: usize = 64 * 1024;       // 64 KiB Puffer beim Streaming-Schreiben
+const DEFAULT_MAX_SIZE_MIB: u64 = 512;            // Standard-Schutzlimit pro Datei gegen Zstd-Bomben (512 MiB)
+const DEFAULT_MAX_ARCHIVE_MIB: u64 = 2048;        // Standard-Schutzlimit für das gesamte JSON-Input-Dokument (2 GiB)
 const MAX_ENCODING_STEPS: usize = 2;              // Maximal ["zstd", "base64"]
+const MAX_SYMLINK_HOPS: usize = 40;               // Analog zu Linux MAXSYMLINKS (ELOOP-Schutz)
 
 const REPOSITORY_URL: &str = "https://github.com/luisek03/folder2json";
 
@@ -24,18 +28,18 @@ const AI_INSTRUCTIONS: &str = "This JSON file is a flat directory archive. For s
 
 const SCHEMA_DESCRIPTION: &str = "Top-level metadata describes the archive, while \"files\" holds an array of file objects. Each file object defines its relative location via \"path\", POSIX permissions via \"mode\", a 16-character truncated SHA-256 \"hash\" for byte integrity, and an entry \"type\": \"text\" stores raw UTF-8 content directly in \"content\"; \"binary\" stores byte streams encoded per the \"encoding\" pipeline array (e.g. [\"zstd\", \"base64\"] or [\"base64\"]); \"symlink\" indicates a symbolic link pointing to \"target\"; \"link\" denotes an identical deduplicated file whose \"content\" references the canonical file's \"path\". To reconstruct files programmatically, resolve all \"link\" chains to their canonical source, decode the payload by processing \"encoding\" in reverse order, verify the first 16 hex chars of the reconstructed bytes against \"hash\", and write to disk. A complete Python decoder function implementing this workflow is provided in \"python_reference\".";
 
-const PYTHON_REFERENCE: &str = "import json, base64, hashlib\n\ntry:\n    import zstandard as zstd\nexcept ImportError:\n    zstd = None\n\ndef get_file_bytes(json_path, rel_path):\n    with open(json_path, 'r', encoding='utf-8') as f:\n        data = json.load(f)\n    files_map = {e['path']: e for e in data['files']}\n    curr = files_map.get(rel_path)\n    seen = set()\n    while curr and curr.get('type') == 'link':\n        p = curr['path']\n        if p in seen:\n            raise RuntimeError(f\"Cyclic link detected at {p}\")\n        seen.add(p)\n        curr = files_map.get(curr.get('content'))\n    if not curr:\n        return None\n    \n    if curr['type'] == 'text':\n        b = curr.get('content', '').encode('utf-8')\n    else:\n        b = curr.get('content', '').encode('ascii')\n        for enc in reversed(curr.get('encoding', ['base64'])):\n            if enc == 'base64':\n                b = base64.b64decode(b)\n            elif enc == 'zstd':\n                if not zstd:\n                    raise RuntimeError(\"pip install zstandard required to decompress this file\")\n                dctx = zstd.ZstdDecompressor()\n                b = dctx.decompress(b, max_output_size=536870912)\n            else:\n                raise RuntimeError(f\"Unsupported encoding: {enc}\")\n    \n    h = hashlib.sha256(b).hexdigest()[:16]\n    expected = curr.get('hash')\n    if not expected or h != expected:\n        raise RuntimeError(f\"Hash mismatch! Expected {expected}, got {h}\")\n    return b";
+const PYTHON_REFERENCE: &str = "import json, base64, hashlib\n\ntry:\n    import zstandard as zstd\nexcept ImportError:\n    zstd = None\n\ndef get_file_bytes(json_path, rel_path):\n    with open(json_path, 'r', encoding='utf-8') as f:\n        data = json.load(f)\n    files_map = {}\n    for e in data.get('files', []):\n        files_map.setdefault(e['path'], e)\n    curr = files_map.get(rel_path)\n    seen = set()\n    while curr and curr.get('type') == 'link':\n        p = curr['path']\n        if p in seen:\n            raise RuntimeError(f\"Cyclic link detected at {p}\")\n        seen.add(p)\n        curr = files_map.get(curr.get('content'))\n    if not curr:\n        return None\n    \n    if curr['type'] == 'text':\n        b = curr.get('content', '').encode('utf-8')\n    else:\n        b = curr.get('content', '').encode('ascii')\n        for enc in reversed(curr.get('encoding', ['base64'])):\n            if enc == 'base64':\n                b = base64.b64decode(b)\n            elif enc == 'zstd':\n                if not zstd:\n                    raise RuntimeError(\"pip install zstandard required to decompress this file\")\n                dctx = zstd.ZstdDecompressor()\n                with dctx.stream_reader(b) as reader:\n                    b = reader.read(536870913)\n                    if len(b) > 536870912:\n                        raise RuntimeError(\"Decompressed data exceeds 512 MiB limit\")\n            else:\n                raise RuntimeError(f\"Unsupported encoding: {enc}\")\n    \n    h = hashlib.sha256(b).hexdigest()[:16]\n    expected = curr.get('hash')\n    if not expected or h != expected:\n        raise RuntimeError(f\"Hash mismatch! Expected {expected}, got {h}\")\n    return b";
 
 #[derive(Parser)]
 #[command(
 name = "folder2json",
-author = "Luis",
+author = "luisek03",
 version,
 about = "Lossless folder archiving into self-contained, AI-optimized JSON.",
 long_about = "A high-performance CLI utility to pack and unpack directory trees into JSON format.\n\
 Designed for LLM context injection, shell pipelines (Stdin/Stdout), and bit-exact\n\
-source code archiving with cryptographic SHA-256 integrity verification and\n\
-strict path-traversal / decompression-bomb protection."
+source code archiving with SHA-256 integrity checks, O(1) RAM streaming, and\n\
+strict path-traversal / symlink-escape / decompression-bomb protection."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -47,7 +51,7 @@ enum Commands {
     /// Pack a folder into a JSON archive (use '-' for stdout)
     #[command(
     long_about = "Packs all files, metadata, and permissions of a directory tree into a single JSON file.\n\
-Outputs raw UTF-8 for plaintext files, and encoded byte streams for binary files.\n\
+Outputs raw UTF-8 for plaintext files, and streamed zstd+base64 for binary files.\n\
 Supports deduplication, automatic integrity hashing, and UNIX permission retention.\n\n\
 EXAMPLES:\n  \
 folder2json pack ./my-project archive.json\n  \
@@ -85,13 +89,13 @@ folder2json pack ./src output.json -a -e target -e '*.log'"
     /// Unpack a JSON archive back into a folder (use '-' for stdin)
     #[command(
     long_about = "Restores a directory tree from a JSON archive created by this tool.\n\
-Reconstructs file hierarchy, decodes payloads, recreates symlinks,\n\
-restores exact POSIX permissions, and validates 16-character SHA-256 hashes.\n\
-Enforces strict scope validation against path traversal (../, ~/, /) and symlink escapes.\n\n\
+Reconstructs file hierarchy, streams payloads to disk, recreates symlinks,\n\
+restores POSIX permissions, and validates 16-character SHA-256 checksums.\n\
+Enforces strict scope validation against path traversal (../, ~/, /) and chained symlink escapes.\n\n\
 EXAMPLES:\n  \
 folder2json unpack archive.json ./restored\n  \
 xz -dc archive.json.xz | folder2json unpack - ./restored\n  \
-folder2json unpack archive.json ./restored --no-verify"
+folder2json unpack archive.json ./restored --force --no-verify"
     )]
     Unpack {
         /// Input JSON archive path, or '-' to read directly from stdin
@@ -100,21 +104,29 @@ folder2json unpack archive.json ./restored --no-verify"
         /// Target folder where files should be extracted
         dst: PathBuf,
 
-        /// Skip 16-char SHA-256 cryptographic integrity checks
-        #[arg(long = "no-verify")]
-        no_verify: bool,
+        /// Overwrite existing files in the target directory (blocked by default)
+        #[arg(short = 'f', long = "force")]
+        force: bool,
 
-        /// Allow symlinks whose target points outside the destination directory (blocked by default)
-        #[arg(long = "allow-external-symlinks")]
-        allow_external_symlinks: bool,
+            /// Skip 16-char SHA-256 integrity checks
+            #[arg(long = "no-verify")]
+            no_verify: bool,
 
-        /// Maximum allowed decompressed size per binary file in MiB (protects against zstd bombs)
-        #[arg(long = "max-size-mib", default_value_t = DEFAULT_MAX_SIZE_MIB)]
-        max_size_mib: u64,
+            /// Allow symlinks whose target points outside the destination directory (blocked by default)
+            #[arg(long = "allow-external-symlinks")]
+            allow_external_symlinks: bool,
 
-        /// Verbose output showing each extracted or linked file
-        #[arg(short = 'v', long = "verbose")]
-        verbose: bool,
+            /// Maximum allowed decompressed size per file in MiB (protects against zstd bombs)
+            #[arg(long = "max-size-mib", default_value_t = DEFAULT_MAX_SIZE_MIB)]
+            max_size_mib: u64,
+
+            /// Maximum allowed input JSON archive size in MiB (protects against unbounded stdin OOM)
+            #[arg(long = "max-archive-mib", default_value_t = DEFAULT_MAX_ARCHIVE_MIB)]
+            max_archive_mib: u64,
+
+            /// Verbose output showing each extracted or linked file
+            #[arg(short = 'v', long = "verbose")]
+            verbose: bool,
     },
 }
 
@@ -159,6 +171,144 @@ struct ArchiveEntry {
     encoding: Option<Vec<String>>,
 }
 
+/// Streaming Base64-Writer: Nimmt beliebig große Datenströme entgegen und schreibt
+/// sie in 48-KiB-Triplets als Base64 in den darunterliegenden Writer (konstanter RAM).
+struct Base64EncoderWriter<'a, W: Write> {
+    inner: &'a mut W,
+    tail: [u8; 3],
+    tail_len: usize,
+}
+
+impl<'a, W: Write> Base64EncoderWriter<'a, W> {
+    fn new(inner: &'a mut W) -> Self {
+        Self {
+            inner,
+            tail: [0u8; 3],
+            tail_len: 0,
+        }
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        if self.tail_len > 0 {
+            let encoded = BASE64.encode(&self.tail[..self.tail_len]);
+            self.inner.write_all(encoded.as_bytes())?;
+            self.tail_len = 0;
+        }
+        Ok(())
+    }
+}
+
+impl<'a, W: Write> Write for Base64EncoderWriter<'a, W> {
+    fn write(&mut self, mut buf: &[u8]) -> io::Result<usize> {
+        let orig_len = buf.len();
+        if orig_len == 0 {
+            return Ok(0);
+        }
+
+        if self.tail_len > 0 {
+            let need = 3 - self.tail_len;
+            if buf.len() < need {
+                self.tail[self.tail_len..self.tail_len + buf.len()].copy_from_slice(buf);
+                self.tail_len += buf.len();
+                return Ok(orig_len);
+            }
+            self.tail[self.tail_len..3].copy_from_slice(&buf[..need]);
+            let encoded = BASE64.encode(&self.tail[..3]);
+            self.inner.write_all(encoded.as_bytes())?;
+            self.tail_len = 0;
+            buf = &buf[need..];
+        }
+
+        while buf.len() >= 3 {
+            let take = (buf.len().min(B64_ENCODE_CHUNK) / 3) * 3;
+            let encoded = BASE64.encode(&buf[..take]);
+            self.inner.write_all(encoded.as_bytes())?;
+            buf = &buf[take..];
+        }
+
+        if !buf.is_empty() {
+            self.tail[..buf.len()].copy_from_slice(buf);
+            self.tail_len = buf.len();
+        }
+
+        Ok(orig_len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Streaming Base64-Reader: Dekodiert einen Base64-Slice blockweise in 64-KiB-Quanten,
+/// ohne das gesamte Binär-Array im RAM allozieren zu müssen.
+struct Base64SliceReader<'a> {
+    src: &'a [u8],
+    src_pos: usize,
+    b64_buf: Vec<u8>,
+    decoded_buf: Vec<u8>,
+    decoded_pos: usize,
+    done: bool,
+}
+
+impl<'a> Base64SliceReader<'a> {
+    fn new(src: &'a [u8]) -> Self {
+        Self {
+            src,
+            src_pos: 0,
+            b64_buf: Vec::with_capacity(B64_DECODE_CHUNK),
+            decoded_buf: Vec::new(),
+            decoded_pos: 0,
+            done: false,
+        }
+    }
+}
+
+impl<'a> Read for Base64SliceReader<'a> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            if self.decoded_pos < self.decoded_buf.len() {
+                let avail = self.decoded_buf.len() - self.decoded_pos;
+                let take = avail.min(out.len());
+                out[..take].copy_from_slice(
+                    &self.decoded_buf[self.decoded_pos..self.decoded_pos + take],
+                );
+                self.decoded_pos += take;
+                return Ok(take);
+            }
+
+            if self.done {
+                return Ok(0);
+            }
+
+            self.b64_buf.clear();
+            while self.src_pos < self.src.len() && self.b64_buf.len() < B64_DECODE_CHUNK {
+                let b = self.src[self.src_pos];
+                self.src_pos += 1;
+                if !b.is_ascii_whitespace() {
+                    self.b64_buf.push(b);
+                }
+            }
+
+            if self.b64_buf.is_empty() {
+                self.done = true;
+                return Ok(0);
+            }
+
+            self.decoded_buf = BASE64.decode(&self.b64_buf).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Base64-Fehler: {}", e),
+                )
+            })?;
+            self.decoded_pos = 0;
+        }
+    }
+}
+
 fn is_already_compressed(path_str: &str) -> bool {
     let lower = path_str.to_lowercase();
 
@@ -172,6 +322,22 @@ fn is_already_compressed(path_str: &str) -> bool {
     ];
 
     COMPRESSED_EXTS.iter().any(|ext| lower.ends_with(ext))
+}
+
+fn is_potentially_sensitive(rel_posix: &str) -> bool {
+    let file_name = Path::new(rel_posix)
+    .file_name()
+    .map(|f| f.to_string_lossy().to_lowercase())
+    .unwrap_or_default();
+
+    rel_posix == ".git/config"
+    || file_name == ".env"
+    || file_name.starts_with(".env.")
+    || file_name == "id_rsa"
+    || file_name == "id_ed25519"
+    || file_name == "id_ecdsa"
+    || file_name.ends_with(".pem")
+    || file_name.ends_with(".key")
 }
 
 /// Iterative Glob-Matching-Engine in O(N * M) ohne ReDoS-Backtracking-Risiko
@@ -298,7 +464,7 @@ fn matches_exclude(rel_path: &Path, excludes: &[String]) -> bool {
     false
 }
 
-/// Liest die Datei komplett für den SHA-256-Hash und prüft gleichzeitig über die
+/// Liest die Datei in 1-MiB-Blöcken für den SHA-256-Hash und prüft gleichzeitig über die
 /// gesamte Dateilänge, ob es sich um valides, nullbyte-freies UTF-8 handelt.
 fn analyze_file(full_path: &Path) -> io::Result<(String, u64, bool)> {
     let mut f = File::open(full_path)?;
@@ -421,6 +587,7 @@ fn stream_text_into_json<W: Write>(
     Ok((digest, total_read))
 }
 
+/// Echtes O(1)-RAM-Streaming für Binärdateien (sowohl mit Zstd als auch mit reinem Base64).
 fn stream_binary_into_json<W: Write>(
     f_out: &mut W,
     full_path: &Path,
@@ -430,34 +597,34 @@ fn stream_binary_into_json<W: Write>(
     let mut fs = File::open(full_path)?;
     let mut hasher = Sha256::new();
     let mut total_read = 0u64;
+    let mut buf = vec![0u8; READ_CHUNK];
 
     if compress_with_zstd {
-        let mut raw_data = Vec::new();
-        fs.read_to_end(&mut raw_data)?;
-        hasher.update(&raw_data);
-        total_read = raw_data.len() as u64;
-        let compressed = zstd::encode_all(&raw_data[..], 3)?;
-        let encoded = BASE64.encode(&compressed);
-        f_out.write_all(encoded.as_bytes())?;
-    } else {
-        let mut buf = vec![0u8; B64_CHUNK];
+        let b64_writer = Base64EncoderWriter::new(f_out);
+        let mut zstd_enc = zstd::Encoder::new(b64_writer, 3)?;
         loop {
-            let mut filled = 0;
-            while filled < B64_CHUNK {
-                let n = fs.read(&mut buf[filled..])?;
-                if n == 0 {
-                    break;
-                }
-                filled += n;
-            }
-            if filled == 0 {
+            let n = fs.read(&mut buf)?;
+            if n == 0 {
                 break;
             }
-            hasher.update(&buf[..filled]);
-            total_read += filled as u64;
-            let encoded = BASE64.encode(&buf[..filled]);
-            f_out.write_all(encoded.as_bytes())?;
+            hasher.update(&buf[..n]);
+            total_read += n as u64;
+            zstd_enc.write_all(&buf[..n])?;
         }
+        let b64_writer = zstd_enc.finish()?;
+        b64_writer.finish()?;
+    } else {
+        let mut b64_writer = Base64EncoderWriter::new(f_out);
+        loop {
+            let n = fs.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            total_read += n as u64;
+            b64_writer.write_all(&buf[..n])?;
+        }
+        b64_writer.finish()?;
     }
 
     f_out.write_all(b"\"")?;
@@ -530,6 +697,13 @@ fn walk_dir(
             continue;
         }
 
+        if is_potentially_sensitive(&rel_posix) {
+            eprintln!(
+                "⚠️  SICHERHEITSHINWEIS: Potenziell sensible Datei '{}' wird ins Archiv gepackt!",
+                rel_posix
+            );
+        }
+
         if ft.is_symlink() {
             let target_path = fs::read_link(&full)
             .map_err(|e| format!("Fehler beim Lesen des Symlinks '{}': {}", rel_posix, e))?;
@@ -545,7 +719,6 @@ fn walk_dir(
             continue;
         }
 
-        // Sicherheitsschutz gegen Blockade durch FIFOs (Named Pipes), Sockets oder Device-Nodes
         if !ft.is_file() {
             eprintln!(
                 "WARN: Spezialdatei '{}' (FIFO/Socket/Device) wird übersprungen.",
@@ -561,6 +734,16 @@ fn walk_dir(
 
         let (digest, size, is_text) = analyze_file(&full)
         .map_err(|e| format!("Fehler beim Analysieren von '{}': {}", rel_posix, e))?;
+
+        if size > DEFAULT_MAX_SIZE_MIB * 1024 * 1024 {
+            eprintln!(
+                "ℹ️  HINWEIS: '{}' ({}) überschreitet das Standard-Entpacklimit von {} MiB. \
+Beim Entpacken '--max-size-mib' angeben.",
+rel_posix,
+fmt_size(size),
+                      DEFAULT_MAX_SIZE_MIB
+            );
+        }
 
         entries.push(PackEntry {
             rel: rel_posix,
@@ -909,15 +1092,13 @@ fn validate_safe_rel_path(raw_path: &str) -> Result<PathBuf, String> {
     }
 
     if raw_path.contains('\0') || raw_path.contains('\\') {
-        return Err(format!(
-            "Gefährliche Pfad-Manipulation (Backslash '\\' oder Null-Byte) blockiert."
-        ));
+        return Err(
+            "Gefährliche Pfad-Manipulation (Backslash '\\' oder Null-Byte) blockiert.".to_string(),
+        );
     }
 
     if raw_path.starts_with('/') || raw_path.starts_with('~') {
-        return Err(format!(
-            "Absolute Pfade ('/') oder Home-Referenzen ('~') blockiert."
-        ));
+        return Err("Absolute Pfade ('/') oder Home-Referenzen ('~') blockiert.".to_string());
     }
 
     let mut clean = PathBuf::new();
@@ -946,10 +1127,12 @@ fn validate_safe_rel_path(raw_path: &str) -> Result<PathBuf, String> {
     Ok(clean)
 }
 
-/// Prüft, ob das Ziel eines Symlinks innerhalb des Zielordners (`dst`) bleibt.
-fn validate_symlink_target(
+/// Simuliert die komplette Betriebssystem-Auflösung eines Symlinks innerhalb von `dst`
+/// unter Berücksichtigung aller anderen Symlinks im Archiv (verhindert mehrstufige Symlink-Ketten-Escapes).
+fn validate_symlink_target_graph(
     entry_clean_rel: &Path,
     sym_target: &str,
+    symlink_map: &HashMap<PathBuf, String>,
     allow_external: bool,
 ) -> Result<(), String> {
     if sym_target.is_empty() || sym_target.contains('\0') {
@@ -960,36 +1143,68 @@ fn validate_symlink_target(
         return Ok(());
     }
 
-    if sym_target.contains('\\') || sym_target.starts_with('/') || sym_target.starts_with('~') {
-        return Err("Symlink-Escape (Ziel außerhalb des Ordners) blockiert.".to_string());
-    }
+    let check_raw_target = |t: &str| -> Result<Vec<String>, String> {
+        if t.is_empty() || t.contains('\0') || t.contains('\\') || t.starts_with('/') || t.starts_with('~') {
+            return Err("Symlink-Escape (absoluter Pfad, '\\' oder '~') blockiert.".to_string());
+        }
+        let mut tokens = Vec::new();
+        for comp in Path::new(t).components() {
+            match comp {
+                Component::Normal(c) => {
+                    let s = c.to_string_lossy();
+                    if s == "~" || s.starts_with('~') {
+                        return Err("Tilde '~' im Symlink-Ziel blockiert.".to_string());
+                    }
+                    tokens.push(s.into_owned());
+                }
+                Component::CurDir => {}
+                Component::ParentDir => tokens.push("..".to_string()),
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err("Root/Prefix-Referenz im Symlink blockiert.".to_string());
+                }
+            }
+        }
+        Ok(tokens)
+    };
 
-    let mut depth_stack: Vec<String> = Vec::new();
+    let mut current_stack: Vec<String> = Vec::new();
     if let Some(parent) = entry_clean_rel.parent() {
         for comp in parent.components() {
             if let Component::Normal(c) = comp {
-                depth_stack.push(c.to_string_lossy().into_owned());
+                current_stack.push(c.to_string_lossy().into_owned());
             }
         }
     }
 
-    for comp in Path::new(sym_target).components() {
-        match comp {
-            Component::Normal(c) => {
-                let s = c.to_string_lossy();
-                if s == "~" || s.starts_with('~') {
-                    return Err("Tilde '~' im Symlink-Ziel blockiert.".to_string());
-                }
-                depth_stack.push(s.into_owned());
+    // Arbeits-Stack (umgekehrte Reihenfolge für O(1) pop())
+    let mut work: Vec<String> = check_raw_target(sym_target)?.into_iter().rev().collect();
+    let mut hops = 0usize;
+
+    while let Some(token) = work.pop() {
+        if token == ".." {
+            if current_stack.pop().is_none() {
+                return Err(
+                    "Symlink-Traversal ('..') verlässt (direkt oder über verkettete Symlinks) den Zielordner-Scope."
+                    .to_string(),
+                );
             }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if depth_stack.pop().is_none() {
-                    return Err("Symlink-Traversal ('..') verlässt den Scope.".to_string());
+        } else {
+            current_stack.push(token);
+            let current_rel: PathBuf = current_stack.iter().collect();
+            if let Some(nested_target) = symlink_map.get(&current_rel) {
+                hops += 1;
+                if hops > MAX_SYMLINK_HOPS {
+                    return Err(
+                        "Zyklische Symlink-Kette (zu viele Symlink-Hops) im Archiv blockiert."
+                        .to_string(),
+                    );
                 }
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err("Root/Prefix-Referenz im Symlink blockiert.".to_string());
+                // Der Symlink selbst wird durch sein Ziel relativ zu seinem Elternordner ersetzt
+                current_stack.pop();
+                let nested_tokens = check_raw_target(nested_target)?;
+                for nt in nested_tokens.into_iter().rev() {
+                    work.push(nt);
+                }
             }
         }
     }
@@ -998,7 +1213,7 @@ fn validate_symlink_target(
 }
 
 /// Erstellt Elternverzeichnisse Komponente für Komponente und stellt sicher,
-/// dass kein einziger Ordner auf dem Pfad ein Symlink ist (verhindert 2-Stage-Symlink-Traversal).
+/// dass kein einziger Ordner auf dem Pfad ein Symlink ist.
 fn ensure_safe_parent_dirs(dst_canon: &Path, clean_rel: &Path) -> Result<PathBuf, String> {
     let mut current = dst_canon.to_path_buf();
 
@@ -1010,9 +1225,8 @@ fn ensure_safe_parent_dirs(dst_canon: &Path, clean_rel: &Path) -> Result<PathBuf
                     Ok(meta) => {
                         if meta.file_type().is_symlink() {
                             return Err(format!(
-                                "🚨 KRITISCHE SICHERHEITSWARNUNG: Symlink-Traversal-Angriff erkannt!\n\
-Das Elternverzeichnis '{}' ist ein Symlink. Schreiben durch Symlinks ist blockiert!",
-current.display()
+                                "Symlink-Traversal blockiert: Elternverzeichnis '{}' ist ein Symlink!",
+                                current.display()
                             ));
                         }
                         if !meta.file_type().is_dir() {
@@ -1053,36 +1267,13 @@ current.display()
 
     if !canon_parent.starts_with(dst_canon) {
         return Err(format!(
-            "🚨 KRITISCHE SICHERHEITSWARNUNG: Zielpfad '{}' liegt außerhalb des Zielordners '{}'!",
+            "Zielpfad '{}' liegt außerhalb des Zielordners '{}'!",
             canon_parent.display(),
                            dst_canon.display()
         ));
     }
 
     Ok(canon_parent.join(clean_rel.file_name().unwrap()))
-}
-
-/// Dekomprimiert Zstd-Daten mit einer harten Obergrenze gegen Zip-/Zstd-Bomben.
-fn decode_zstd_bounded(compressed: &[u8], max_bytes: u64, entry_path: &str) -> Result<Vec<u8>, String> {
-    let decoder = zstd::Decoder::new(compressed)
-    .map_err(|e| format!("Zstd-Init-Fehler bei '{}': {}", entry_path, e))?;
-    let mut limited_reader = decoder.take(max_bytes.saturating_add(1));
-    let mut out = Vec::new();
-    limited_reader
-    .read_to_end(&mut out)
-    .map_err(|e| format!("Zstd-Decompress-Fehler bei '{}': {}", entry_path, e))?;
-
-    if out.len() as u64 > max_bytes {
-        return Err(format!(
-            "🚨 KRITISCHE SICHERHEITSWARNUNG: Dekompressionsbombe (Zstd-Bomb) bei '{}' erkannt!\n\
-Die entpackte Datei überschreitet das Sicherheitslimit von {} MiB.\n\
-Entpackvorgang abgebrochen (Limit anpassbar via '--max-size-mib').",
-                           entry_path,
-                           max_bytes / (1024 * 1024)
-        ));
-    }
-
-    Ok(out)
 }
 
 fn is_valid_short_sha256(h: &str) -> bool {
@@ -1105,7 +1296,7 @@ fn resolve_link<'a>(
         .ok_or_else(|| format!("Link-Eintrag '{}' hat kein content-Feld.", p))?;
         entry = by_path.get(target_ref).copied().ok_or_else(|| {
             format!(
-                "Link-Ziel '{}' (verwiesen von '{}') nicht im Archiv.",
+                "Link-Ziel '{}' (verwiesen von '{}') nicht im Archiv oder ungültig.",
                     target_ref, p
             )
         })?;
@@ -1113,58 +1304,237 @@ fn resolve_link<'a>(
     Ok(entry)
 }
 
+/// Schreibt einen beliebigen Read-Stream mit hartem Größenlimit in eine temporäre Datei,
+/// prüft den SHA-256-Hash und benennt die Datei erst bei Erfolg atomar um.
+/// Verhindert RAM-Spitzen (O(1) Speicher) und schützt vor Hardlink-Überschreibungen.
+fn write_stream_verified<R: Read>(
+    mut reader: R,
+    target: &Path,
+    expected_hash: Option<&str>,
+    max_bytes: u64,
+    mode: Option<u32>,
+    force: bool,
+        tmp_id: usize,
+) -> Result<(), String> {
+    if let Ok(existing_meta) = fs::symlink_metadata(target) {
+        if existing_meta.file_type().is_dir() {
+            return Err("Am Zielort existiert bereits ein Ordner".to_string());
+        }
+        if !force {
+            return Err(
+                "Datei existiert bereits (nutze '-f' / '--force' zum Überschreiben)".to_string(),
+            );
+        }
+    }
+
+    let parent = target
+    .parent()
+    .ok_or_else(|| "Ungültiger Zielpfad ohne Elternordner".to_string())?;
+    let tmp_path = parent.join(format!(
+        ".folder2json.tmp.{}.{}",
+        process::id(),
+                                       tmp_id
+    ));
+
+    let mut write_and_hash = || -> Result<String, String> {
+        let f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .map_err(|e| format!("Konnte temporäre Datei nicht anlegen: {}", e))?;
+        let mut writer = BufWriter::new(f);
+        let mut hasher = Sha256::new();
+        let mut total_written: u64 = 0;
+        let mut buf = [0u8; STREAM_COPY_CHUNK];
+
+        loop {
+            let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("Stream-Lesefehler: {}", e))?;
+            if n == 0 {
+                break;
+            }
+            total_written = total_written.saturating_add(n as u64);
+            if total_written > max_bytes {
+                return Err(format!(
+                    "Dekompressionsbombe / Größenlimit überschritten (> {} MiB, anpassbar via '--max-size-mib')",
+                                   max_bytes / (1024 * 1024)
+                ));
+            }
+            hasher.update(&buf[..n]);
+            writer
+            .write_all(&buf[..n])
+            .map_err(|e| format!("Schreibfehler: {}", e))?;
+        }
+
+        writer.flush().map_err(|e| format!("Flush-Fehler: {}", e))?;
+        let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+        Ok(digest.chars().take(16).collect())
+    };
+
+    let actual_short = match write_and_hash() {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+    };
+
+    if let Some(expected) = expected_hash {
+        if actual_short != expected {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!(
+                "Hash-Mismatch! Erwartet: {}, Erhalten: {}",
+                expected, actual_short
+            ));
+        }
+    }
+
+    if let Some(raw_mode) = mode {
+        if raw_mode & !0o777 != 0 {
+            eprintln!(
+                "⚠️  SICHERHEITSHINWEIS: Spezial-Bits (SUID/SGID/Sticky: {:o}) wurden entfernt.",
+                      raw_mode
+            );
+        }
+        let safe_mode = raw_mode & 0o777;
+        if let Err(e) = fs::set_permissions(&tmp_path, Permissions::from_mode(safe_mode)) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("Konnte Berechtigungen nicht setzen: {}", e));
+        }
+    }
+
+    if let Err(e) = fs::rename(&tmp_path, target) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("Atomares Umbenennen fehlgeschlagen: {}", e));
+    }
+
+    Ok(())
+}
+
 fn unpack(
     in_arg: &str,
     dst: &Path,
-    verbose: bool,
-    no_verify: bool,
-    allow_external_symlinks: bool,
-    max_size_mib: u64,
+    force: bool,
+        verbose: bool,
+        no_verify: bool,
+        allow_external_symlinks: bool,
+        max_size_mib: u64,
+        max_archive_mib: u64,
 ) -> Result<(usize, usize, Vec<String>), String> {
     let max_decompressed_bytes = max_size_mib.saturating_mul(1024 * 1024);
+    let max_archive_bytes = max_archive_mib.saturating_mul(1024 * 1024);
 
-    let raw = if in_arg == "-" {
-        let mut buffer = String::new();
-        io::stdin()
-        .read_to_string(&mut buffer)
-        .map_err(|e| format!("Fehler beim Lesen von Stdin: {}", e))?;
-        buffer
+    let doc: ArchiveDoc = if in_arg == "-" {
+        let stdin = io::stdin();
+        let bounded = BufReader::new(stdin.lock()).take(max_archive_bytes.saturating_add(1));
+        serde_json::from_reader(bounded).map_err(|e| {
+            format!(
+                "Ungültiges JSON oder Archiv überschreitet Limit von {} MiB ('--max-archive-mib'): {}",
+                    max_archive_mib, e
+            )
+        })?
     } else {
         let in_resolved = fs::canonicalize(Path::new(in_arg))
         .map_err(|e| format!("Kann '{}' nicht öffnen: {}", in_arg, e))?;
-        fs::read_to_string(&in_resolved)
-        .map_err(|e| format!("Fehler beim Lesen von '{}': {}", in_resolved.display(), e))?
+        let meta = fs::metadata(&in_resolved)
+        .map_err(|e| format!("Kann Metadaten von '{}' nicht lesen: {}", in_resolved.display(), e))?;
+        if meta.len() > max_archive_bytes {
+            return Err(format!(
+                "Archiv '{}' ({}) überschreitet das Limit von {} MiB (anpassbar via '--max-archive-mib').",
+                               in_resolved.display(),
+                               fmt_size(meta.len()),
+                               max_archive_mib
+            ));
+        }
+        let file = File::open(&in_resolved)
+        .map_err(|e| format!("Fehler beim Öffnen von '{}': {}", in_resolved.display(), e))?;
+        serde_json::from_reader(BufReader::new(file))
+        .map_err(|e| format!("Ungültiges JSON: {}", e))?
     };
-
-    let doc: ArchiveDoc = serde_json::from_str(&raw)
-    .map_err(|e| format!("Ungültiges JSON: {}", e))?;
 
     let mut failed_files = Vec::new();
     let mut seen_clean_paths: HashSet<PathBuf> = HashSet::new();
     let mut validated_paths: Vec<Option<PathBuf>> = Vec::with_capacity(doc.files.len());
+    let mut by_path: HashMap<&str, &ArchiveEntry> = HashMap::new();
+    let mut symlink_map: HashMap<PathBuf, String> = HashMap::new();
 
-    // Pre-Pass: Validierung
+    // Pre-Pass A: Grundlegende Pfad-Validierung & Duplikat-Filter
     for entry in &doc.files {
         match validate_safe_rel_path(&entry.path) {
             Ok(clean_rel) => {
                 if !seen_clean_paths.insert(clean_rel.clone()) {
-                    failed_files.push(format!("'{}': Duplizierter Pfad im Archiv (wird übersprungen)", entry.path));
+                    let msg = "Duplizierter Pfad im Archiv (wird übersprungen)".to_string();
+                    eprintln!("❌ Übersprungen: '{}' ({})", entry.path, msg);
+                    failed_files.push(format!("'{}': {}", entry.path, msg));
                     validated_paths.push(None);
                     continue;
                 }
                 if entry.entry_type == "symlink" {
-                    let sym_target = entry.target.as_deref().unwrap_or("");
-                    if let Err(e) = validate_symlink_target(&clean_rel, sym_target, allow_external_symlinks) {
-                        failed_files.push(format!("'{}': {}", entry.path, e));
-                        validated_paths.push(None);
-                        continue;
-                    }
+                    let sym_target = entry.target.as_deref().unwrap_or("").to_string();
+                    symlink_map.insert(clean_rel.clone(), sym_target);
                 }
+                by_path.insert(entry.path.as_str(), entry);
                 validated_paths.push(Some(clean_rel));
             }
             Err(e) => {
+                eprintln!("❌ Übersprungen: '{}' ({})", entry.path, e);
                 failed_files.push(format!("'{}': {}", entry.path, e));
                 validated_paths.push(None);
+            }
+        }
+    }
+
+    // Pre-Pass B: Verkettete Symlinks & Symlink-Elternverzeichnisse prüfen
+    for (entry, clean_rel_opt) in doc.files.iter().zip(validated_paths.iter_mut()) {
+        let clean_rel = match clean_rel_opt {
+            Some(ref p) => p.clone(),
+            None => continue,
+        };
+
+        // Kein Eintrag darf einen Symlink aus dem Archiv als Elternverzeichnis durchlaufen
+        let mut ancestor = PathBuf::new();
+        if let Some(parent) = clean_rel.parent() {
+            let mut through_symlink = false;
+            for comp in parent.components() {
+                if let Component::Normal(c) = comp {
+                    ancestor.push(c);
+                    if symlink_map.contains_key(&ancestor) {
+                        through_symlink = true;
+                        break;
+                    }
+                }
+            }
+            if through_symlink {
+                let msg = format!(
+                    "Pfad verläuft durch einen Archiv-Symlink ('{}') – blockiert!",
+                                  ancestor.display()
+                );
+                eprintln!("❌ Übersprungen: '{}' ({})", entry.path, msg);
+                failed_files.push(format!("'{}': {}", entry.path, msg));
+                by_path.remove(entry.path.as_str());
+                *clean_rel_opt = None;
+                continue;
+            }
+        }
+
+        if entry.entry_type == "symlink" {
+            let sym_target = entry.target.as_deref().unwrap_or("");
+            if let Err(e) = validate_symlink_target_graph(
+                &clean_rel,
+                sym_target,
+                &symlink_map,
+                allow_external_symlinks,
+            ) {
+                eprintln!("❌ Übersprungen (Symlink): '{}' ({})", entry.path, e);
+                failed_files.push(format!("'{}': {}", entry.path, e));
+                symlink_map.remove(&clean_rel);
+                by_path.remove(entry.path.as_str());
+                *clean_rel_opt = None;
             }
         }
     }
@@ -1174,34 +1544,52 @@ fn unpack(
     let dst_canon = fs::canonicalize(dst)
     .map_err(|e| format!("Kann Zielordner '{}' nicht kanonisieren: {}", dst.display(), e))?;
 
-    let mut by_path: HashMap<&str, &ArchiveEntry> = HashMap::new();
-    for e in &doc.files {
-        by_path.insert(e.path.as_str(), e);
-    }
-
     let mut file_count = 0usize;
     let mut link_count = 0usize;
+    let mut extracted_canon_paths: HashMap<&str, PathBuf> = HashMap::new();
 
-    // Pass 1: Reguläre Dateien
-    for (entry, clean_rel_opt) in doc.files.iter().zip(validated_paths.iter()) {
+    // Pass 1: Kanonische Dateien (text & binary) streamend direkt auf die Platte entpacken
+    for (idx, (entry, clean_rel_opt)) in doc.files.iter().zip(validated_paths.iter()).enumerate() {
         let clean_rel = match clean_rel_opt {
             Some(p) => p,
             None => continue,
         };
 
         let t = entry.entry_type.as_str();
-        if t == "symlink" {
+        if t == "symlink" || t == "link" {
             continue;
         }
 
-        let process_file = || -> Result<(), String> {
-            let resolved = resolve_link(&by_path, entry)?;
-            let rt = resolved.entry_type.as_str();
+        let process_canonical = || -> Result<PathBuf, String> {
+            let expected_hash = if !no_verify {
+                let h = entry
+                .hash
+                .as_deref()
+                .ok_or_else(|| "Fehlender SHA-256-Hash".to_string())?;
+                if !is_valid_short_sha256(h) {
+                    return Err(format!("Ungültiges Hash-Format ('{}')", h));
+                }
+                Some(h)
+            } else {
+                None
+            };
 
-            let decoded_bin: Vec<u8>;
-            let payload_bytes: &[u8] = if rt == "binary" {
-                let mut current_data = resolved.content.as_deref().unwrap_or("").as_bytes().to_vec();
-                let encodings = resolved
+            let target = ensure_safe_parent_dirs(&dst_canon, clean_rel)?;
+
+            if t == "text" {
+                let text_bytes = entry.content.as_deref().unwrap_or("").as_bytes();
+                write_stream_verified(
+                    text_bytes,
+                    &target,
+                    expected_hash,
+                    max_decompressed_bytes,
+                    entry.mode,
+                    force,
+                        idx,
+                )?;
+            } else if t == "binary" {
+                let raw_b64 = entry.content.as_deref().unwrap_or("").as_bytes();
+                let encodings = entry
                 .encoding
                 .as_deref()
                 .ok_or_else(|| "Fehlendes 'encoding'-Array".to_string())?;
@@ -1210,86 +1598,53 @@ fn unpack(
                     return Err(format!("Ungültige Encoding-Länge ({})", encodings.len()));
                 }
 
-                for enc in encodings.iter().rev() {
-                    if enc == "base64" {
-                        current_data = BASE64
-                        .decode(&current_data)
-                        .map_err(|e| format!("Base64-Fehler: {}", e))?;
-                    } else if enc == "zstd" {
-                        current_data = decode_zstd_bounded(&current_data, max_decompressed_bytes, &entry.path)?;
-                    } else {
-                        return Err(format!("Nicht unterstütztes Encoding '{}'", enc));
+                match encodings {
+                    [b64] if b64 == "base64" => {
+                        let b64_reader = Base64SliceReader::new(raw_b64);
+                        write_stream_verified(
+                            b64_reader,
+                            &target,
+                            expected_hash,
+                            max_decompressed_bytes,
+                            entry.mode,
+                            force,
+                                idx,
+                        )?;
+                    }
+                    [zst, b64] if zst == "zstd" && b64 == "base64" => {
+                        let b64_reader = Base64SliceReader::new(raw_b64);
+                        let zstd_decoder = zstd::Decoder::new(b64_reader)
+                        .map_err(|e| format!("Zstd-Init-Fehler: {}", e))?;
+                        write_stream_verified(
+                            zstd_decoder,
+                            &target,
+                            expected_hash,
+                            max_decompressed_bytes,
+                            entry.mode,
+                            force,
+                                idx,
+                        )?;
+                    }
+                    _ => {
+                        return Err(format!(
+                            "Nicht unterstützte Encoding-Pipeline: {:?}",
+                            encodings
+                        ));
                     }
                 }
-                decoded_bin = current_data;
-                &decoded_bin
-            } else if rt == "text" {
-                let text_str = resolved.content.as_deref().unwrap_or("");
-                text_str.as_bytes()
             } else {
-                return Err(format!("Unerwarteter Typ '{}' als Link-Ziel", rt));
-            };
-
-            if !no_verify {
-                let expected = match (entry.hash.as_deref(), resolved.hash.as_deref()) {
-                    (Some(eh), Some(rh)) if eh != rh => {
-                        return Err(format!("Inkonsistenter Link-Hash ({} != {})", eh, rh));
-                    }
-                    (Some(eh), _) => eh,
-                    (None, Some(rh)) => rh,
-                    (None, None) => return Err("Fehlender SHA-256-Hash".to_string()),
-                };
-
-                if !is_valid_short_sha256(expected) {
-                    return Err(format!("Ungültiges Hash-Format ('{}')", expected));
-                }
-
-                let mut hasher = Sha256::new();
-                hasher.update(payload_bytes);
-                let actual_full: String = hasher
-                .finalize()
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect();
-                let actual_short: String = actual_full.chars().take(16).collect();
-                if actual_short != expected {
-                    return Err(format!(
-                        "Hash-Mismatch! Erwartet: {}, Erhalten: {}",
-                        expected, actual_short
-                    ));
-                }
+                return Err(format!("Unbekannter Dateityp '{}'", t));
             }
 
-            let target = ensure_safe_parent_dirs(&dst_canon, clean_rel)?;
-
-            if let Ok(existing_meta) = fs::symlink_metadata(&target) {
-                if existing_meta.file_type().is_dir() {
-                    return Err("Am Zielort existiert bereits ein Ordner".to_string());
-                }
-                if existing_meta.file_type().is_symlink() {
-                    fs::remove_file(&target).map_err(|e| format!("Symlink-Entfernung fehlgeschlagen: {}", e))?;
-                }
-            }
-
-            fs::write(&target, payload_bytes).map_err(|e| e.to_string())?;
-
-            if let Some(raw_mode) = entry.mode.or(resolved.mode) {
-                let safe_mode = raw_mode & 0o777;
-                fs::set_permissions(&target, Permissions::from_mode(safe_mode))
-                .map_err(|e| e.to_string())?;
-            }
-            Ok(())
+            Ok(target)
         };
 
-        match process_file() {
-            Ok(()) => {
-                if t == "link" {
-                    link_count += 1;
-                }
+        match process_canonical() {
+            Ok(target_path) => {
+                extracted_canon_paths.insert(entry.path.as_str(), target_path);
                 file_count += 1;
                 if verbose {
-                    let tag = if t == "link" { "→" } else { "F" };
-                    println!("  {} {}", tag, entry.path);
+                    println!("  F {}", entry.path);
                 }
             }
             Err(e) => {
@@ -1299,7 +1654,82 @@ fn unpack(
         }
     }
 
-    // Pass 2: Symlinks
+    // Pass 2: Deduplizierte Links direkt von der bereits verifizierten Originaldatei streamen
+    for (idx, (entry, clean_rel_opt)) in doc.files.iter().zip(validated_paths.iter()).enumerate() {
+        let clean_rel = match clean_rel_opt {
+            Some(p) => p,
+            None => continue,
+        };
+
+        if entry.entry_type != "link" {
+            continue;
+        }
+
+        let process_link = || -> Result<&str, String> {
+            let resolved = resolve_link(&by_path, entry)?;
+            let canon_disk_path = extracted_canon_paths
+            .get(resolved.path.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "Originaldatei '{}' konnte zuvor nicht entpackt werden",
+                    resolved.path
+                )
+            })?;
+
+            let expected_hash = if !no_verify {
+                let eh = match (entry.hash.as_deref(), resolved.hash.as_deref()) {
+                    (Some(eh), Some(rh)) if eh != rh => {
+                        return Err(format!("Inkonsistenter Link-Hash ({} != {})", eh, rh));
+                    }
+                    (Some(eh), _) => eh,
+                    (None, Some(rh)) => rh,
+                    (None, None) => return Err("Fehlender SHA-256-Hash".to_string()),
+                };
+                if !is_valid_short_sha256(eh) {
+                    return Err(format!("Ungültiges Hash-Format ('{}')", eh));
+                }
+                Some(eh)
+            } else {
+                None
+            };
+
+            let target = ensure_safe_parent_dirs(&dst_canon, clean_rel)?;
+            let src_file = File::open(canon_disk_path).map_err(|e| {
+                format!(
+                    "Konnte extrahierte Originaldatei '{}' nicht öffnen: {}",
+                    resolved.path, e
+                )
+            })?;
+
+            write_stream_verified(
+                BufReader::new(src_file),
+                                  &target,
+                                  expected_hash,
+                                  max_decompressed_bytes,
+                                  entry.mode.or(resolved.mode),
+                                  force,
+                                      idx,
+            )?;
+
+            Ok(resolved.path.as_str())
+        };
+
+        match process_link() {
+            Ok(canon_rel) => {
+                link_count += 1;
+                file_count += 1;
+                if verbose {
+                    println!("  → {} (← {})", entry.path, canon_rel);
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ Übersprungen (Link): '{}' ({})", entry.path, e);
+                failed_files.push(format!("'{}': {}", entry.path, e));
+            }
+        }
+    }
+
+    // Pass 3: Symlinks anlegen
     for (entry, clean_rel_opt) in doc.files.iter().zip(validated_paths.iter()) {
         let clean_rel = match clean_rel_opt {
             Some(p) => p,
@@ -1314,13 +1744,21 @@ fn unpack(
             let target = ensure_safe_parent_dirs(&dst_canon, clean_rel)?;
             if let Ok(existing_meta) = fs::symlink_metadata(&target) {
                 if existing_meta.file_type().is_dir() {
-                    return Err("Ziel ist bereits ein Ordner".to_string());
+                    return Err("Am Zielort existiert bereits ein Ordner".to_string());
                 }
-                let _ = fs::remove_file(&target);
+                if !force {
+                    return Err(
+                        "Ziel existiert bereits (nutze '-f' / '--force' zum Überschreiben)"
+                        .to_string(),
+                    );
+                }
+                fs::remove_file(&target)
+                .map_err(|e| format!("Konnte bestehende Datei nicht entfernen: {}", e))?;
             }
 
             let sym_target = entry.target.as_deref().unwrap_or("");
-            symlink(sym_target, &target).map_err(|e| format!("Erstellen fehlgeschlagen: {}", e))?;
+            symlink(sym_target, &target)
+            .map_err(|e| format!("Erstellen fehlgeschlagen: {}", e))?;
             Ok(())
         };
 
@@ -1328,7 +1766,11 @@ fn unpack(
             Ok(()) => {
                 file_count += 1;
                 if verbose {
-                    println!("  L {} -> {}", entry.path, entry.target.as_deref().unwrap_or(""));
+                    println!(
+                        "  L {} -> {}",
+                        entry.path,
+                        entry.target.as_deref().unwrap_or("")
+                    );
                 }
             }
             Err(e) => {
@@ -1362,10 +1804,14 @@ fn main() {
 
     match cli.cmd {
         Commands::Pack {
-            // ... (Bleibt exakt wie zuvor) ...
-            src, out, all, exclude, no_dedup, no_compress, verbose,
+            src,
+            out,
+            all,
+            exclude,
+            no_dedup,
+            no_compress,
+            verbose,
         } => {
-            // ... (Hier ändert sich nichts) ...
             let mut excludes: Vec<String> = Vec::new();
             if !all {
                 excludes.push(".*".to_string());
@@ -1401,17 +1847,21 @@ fn main() {
         Commands::Unpack {
             in_json,
             dst,
-            no_verify,
-            allow_external_symlinks,
-            max_size_mib,
-            verbose,
+            force,
+                no_verify,
+                allow_external_symlinks,
+                max_size_mib,
+                max_archive_mib,
+                verbose,
         } => match unpack(
             &in_json,
             &dst,
-            verbose,
-            no_verify,
-            allow_external_symlinks,
-            max_size_mib,
+            force,
+                verbose,
+                no_verify,
+                allow_external_symlinks,
+                max_size_mib,
+                max_archive_mib,
         ) {
             Ok((files, links, failures)) => {
                 println!(
@@ -1429,7 +1879,6 @@ fn main() {
                     for f in &failures {
                         eprintln!("  - {}", f);
                     }
-                    // Rückgabecode 1 signalisiert Shell-Scripts, dass nicht alles 100% glatt lief
                     process::exit(1);
                 }
             }
