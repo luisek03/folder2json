@@ -223,6 +223,7 @@ __marimo__/
 # user zeug.
 
 result
+release
 *result
 *.AppImage
 *.json
