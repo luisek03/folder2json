@@ -34,19 +34,19 @@ fn main() {
             match pack::pack(&src, &out, &excludes, verbose, dedup, no_compress) {
                 Ok((file_len, excluded, stats)) => {
                     if out != "-" {
-                        println!("Gepackt: {} Dateien → {}", file_len, out);
+                        println!("Packed: {} files → {}", file_len, out);
                         if dedup {
                             println!(
-                                "  Unique: {}, verlinkt: {} ({} gespart)",
+                                "  Unique: {}, linked: {} (saved {})",
                                      stats.unique,
                                      stats.linked,
                                      fmt_size(stats.bytes_saved)
                             );
                         } else {
-                            println!("  Dedup deaktiviert (16-Char-Hashes dennoch erzeugt)");
+                            println!("  Deduplication disabled (16-char hashes generated)");
                         }
                         if !excluded.is_empty() {
-                            println!("  {} Einträge ausgeschlossen", excluded.len());
+                            println!("  {} entries excluded", excluded.len());
                         }
                     }
                 }
@@ -77,7 +77,7 @@ fn main() {
         ) {
             Ok((files, links, failures)) => {
                 println!(
-                    "\n✅ Entpackt: {} Dateien → {} (davon {} Links aufgelöst)",
+                    "\n✅ Extracted: {} files → {} ({} links resolved)",
                          files,
                          dst.display(),
                          links
@@ -85,7 +85,7 @@ fn main() {
 
                 if !failures.is_empty() {
                     eprintln!(
-                        "\n⚠️  WARNUNG: {} Datei(en) konnten nicht entpackt werden (manipuliert/fehlerhaft):",
+                        "\n⚠️  WARNING: {} file(s) could not be extracted (corrupted/manipulated):",
                               failures.len()
                     );
                     for f in &failures {
@@ -95,7 +95,7 @@ fn main() {
                 }
             }
             Err(e) => {
-                eprintln!("\n🚨 KRITISCHER FEHLER: {}", e);
+                eprintln!("\n🚨 CRITICAL ERROR: {}", e);
                 process::exit(1);
             }
         },

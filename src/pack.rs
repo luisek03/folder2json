@@ -11,7 +11,6 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -54,7 +53,7 @@ fn walk_dir(
     excluded: &mut Vec<String>,
 ) -> Result<(), String> {
     let read_dir = fs::read_dir(current_dir)
-    .map_err(|e| format!("Fehler beim Lesen des Ordners '{}': {}", current_dir.display(), e))?;
+    .map_err(|e| format!("Failed to read directory '{}': {}", current_dir.display(), e))?;
 
     let mut dirs = Vec::new();
     let mut files = Vec::new();
@@ -95,14 +94,14 @@ fn walk_dir(
 
         if is_potentially_sensitive(&rel_posix) {
             eprintln!(
-                "⚠️  SICHERHEITSHINWEIS: Potenziell sensible Datei '{}' wird ins Archiv gepackt!",
+                "⚠️  SECURITY NOTICE: Potentially sensitive file '{}' included in archive!",
                 rel_posix
             );
         }
 
         if ft.is_symlink() {
             let target_path = fs::read_link(&full)
-            .map_err(|e| format!("Fehler beim Lesen des Symlinks '{}': {}", rel_posix, e))?;
+            .map_err(|e| format!("Failed to read symlink '{}': {}", rel_posix, e))?;
             entries.push(PackEntry {
                 rel: rel_posix,
                 full,
@@ -117,7 +116,7 @@ fn walk_dir(
 
         if !ft.is_file() {
             eprintln!(
-                "WARN: Spezialdatei '{}' (FIFO/Socket/Device) wird übersprungen.",
+                "WARN: Special file '{}' (FIFO/Socket/Device) skipped.",
                       rel_posix
             );
             excluded.push(rel_posix);
@@ -125,19 +124,20 @@ fn walk_dir(
         }
 
         let st = fs::symlink_metadata(&full)
-        .map_err(|e| format!("Fehler bei lstat von '{}': {}", rel_posix, e))?;
+        .map_err(|e| format!("Failed to read lstat for '{}': {}", rel_posix, e))?;
+
         #[cfg(unix)]
         let mode = st.permissions().mode() & 0o777;
         #[cfg(windows)]
-        let mode = 0o644; // Windows nutzt Fallback-Berechtigungen
+        let mode = 0o644;
 
         let (digest, size, is_text) = analyze_file(&full)
-        .map_err(|e| format!("Fehler beim Analysieren von '{}': {}", rel_posix, e))?;
+        .map_err(|e| format!("Failed to analyze file '{}': {}", rel_posix, e))?;
 
         if size > DEFAULT_MAX_SIZE_MIB * 1024 * 1024 {
             eprintln!(
-                "ℹ️  HINWEIS: '{}' ({}) überschreitet das Standard-Entpacklimit von {} MiB. \
-Beim Entpacken '--max-size-mib' angeben.",
+                "ℹ️  NOTE: '{}' ({}) exceeds standard extraction limit of {} MiB. \
+Specify '--max-size-mib' during unpack.",
 rel_posix,
 fmt_size(size),
                       DEFAULT_MAX_SIZE_MIB
@@ -175,9 +175,9 @@ pub fn pack(
     no_compress: bool,
 ) -> Result<(usize, Vec<String>, Stats), String> {
     let src_resolved =
-    fs::canonicalize(src).map_err(|_| format!("Kein Ordner: {}", src.display()))?;
+    fs::canonicalize(src).map_err(|_| format!("Not a directory: {}", src.display()))?;
     if !src_resolved.is_dir() {
-        return Err(format!("Kein Ordner: {}", src_resolved.display()));
+        return Err(format!("Not a directory: {}", src_resolved.display()));
     }
 
     let is_stdout = out_arg == "-";
@@ -230,8 +230,8 @@ pub fn pack(
     let linked_count = Cell::new(0usize);
     let saved_bytes = Cell::new(0u64);
 
-    let write_contents = |writer: &mut dyn Write| -> Result<(), String> {
-        let mut f = BufWriter::new(writer);
+    let write_contents = |writer: &mut dyn std::io::Write| -> Result<(), String> {
+        let mut f = std::io::BufWriter::new(writer);
         let src_name = src_resolved
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -380,10 +380,10 @@ pub fn pack(
                 write!(f, "      \"content\": ").map_err(|e| e.to_string())?;
                 let (actual_hash, actual_size) =
                 stream_binary_into_json(&mut f, &e.full, use_zstd)
-                .map_err(|ex| format!("Fehler beim Lesen von '{}': {}", e.rel, ex))?;
+                .map_err(|ex| format!("Failed to read file '{}': {}", e.rel, ex))?;
                 if actual_hash != expected_full_hash || actual_size != e.size {
                     return Err(format!(
-                        "TOCTOU-Fehler: Datei '{}' wurde während des Packvorgangs verändert!",
+                        "TOCTOU error: file '{}' was modified during archiving!",
                         e.rel
                     ));
                 }
@@ -416,19 +416,19 @@ pub fn pack(
                 Ok((actual_hash, actual_size)) => {
                     if actual_hash != expected_full_hash || actual_size != e.size {
                         return Err(format!(
-                            "TOCTOU-Fehler: Datei '{}' wurde während des Packvorgangs verändert!",
+                            "TOCTOU error: file '{}' was modified during archiving!",
                             e.rel
                         ));
                     }
                 }
                 Err(StreamTextError::InvalidUtf8) => {
                     return Err(format!(
-                        "'{}' wurde während des Packens verändert und enthält nun ungültiges UTF-8.",
+                        "'{}' was modified during archiving and contains invalid UTF-8.",
                         e.rel
                     ));
                 }
                 Err(StreamTextError::Io(ex)) => {
-                    return Err(format!("Fehler beim Lesen von '{}': {}", e.rel, ex));
+                    return Err(format!("Failed to read file '{}': {}", e.rel, ex));
                 }
             }
             write!(f, "\n    }}").map_err(|e| e.to_string())?;
@@ -459,7 +459,7 @@ pub fn pack(
 
         let write_res = (|| -> Result<(), String> {
             let mut file = File::create(&tmp_json)
-            .map_err(|e| format!("Fehler beim Erstellen von '{}': {}", tmp_json.display(), e))?;
+            .map_err(|e| format!("Failed to create temporary file '{}': {}", tmp_json.display(), e))?;
             write_contents(&mut file)
         })();
 
@@ -470,7 +470,7 @@ pub fn pack(
 
         if let Err(e) = fs::rename(&tmp_json, &out_p) {
             let _ = fs::remove_file(&tmp_json);
-            return Err(format!("Fehler beim Umbenennen der temporären Datei: {}", e));
+            return Err(format!("Failed to rename temporary output file: {}", e));
         }
     }
 

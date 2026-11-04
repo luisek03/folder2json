@@ -7,11 +7,11 @@ use std::path::PathBuf;
 name = "folder2json",
 author = "luisek03",
 version,
-about = "Verlustfreies Ordner-Archivieren in selbstentpackendes, KI-optimiertes JSON.",
-long_about = "folder2json - Hochperformantes CLI-Werkzeug zum Packen und Entpacken von Ordnerstrukturen.\n\n\
-Entwickelt für LLM-Kontextinjektion, Shell-Pipelines (Stdin/Stdout) und bitgenaue\n\
-Quellcode-Archivierung mit SHA-256-Prüfsummen, O(1)-RAM-Streaming sowie Härtung\n\
-gegen Path-Traversal, Symlink-Escapes und Zstd-Dekompressionsbomben."
+about = "Lossless folder archiving into self-contained, AI-optimized JSON.",
+long_about = "folder2json - High-performance CLI utility to pack and unpack directory trees.\n\n\
+Designed for LLM context injection, shell pipelines (Stdin/Stdout), and bit-exact\n\
+source code archiving with SHA-256 integrity checks, O(1) RAM streaming, and hardening\n\
+against path traversal, chained symlink escapes, and decompression bombs."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -20,93 +20,93 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Packt einen Ordner in ein JSON-Archiv (nutze '-' für Stdout)
+    /// Pack a folder into a JSON archive (use '-' for stdout)
     #[command(
     name = "pack",
-    about = "Packt Verzeichnisse verlustfrei in ein JSON-Dokument",
-    long_about = "Packt alle Dateien, POSIX-Berechtigungen und Symlinks eines Verzeichnisbaums in ein JSON-Dokument.\n\
-Klartextdateien werden als UTF-8 eingebettet, Binärdateien gestreamt über Zstandard komprimiert\n\
-und Base64-kodiert. Unterstützt Inhalts-Deduplizierung und SHA-256-Integritäts-Hashes.\n\n\
-BEISPIELE:\n  \
-folder2json pack ./mein-projekt archiv.json\n  \
-folder2json pack ./mein-projekt - | xz > archiv.json.xz\n  \
+    about = "Packs a directory structure losslessly into a JSON document",
+    long_about = "Packs all files, POSIX permissions, and symlinks of a directory tree into a single JSON file.\n\
+Plaintext files are embedded as raw UTF-8, binary files are streamed through Zstandard compression\n\
+and Base64 encoding. Supports content deduplication and SHA-256 integrity checks.\n\n\
+EXAMPLES:\n  \
+folder2json pack ./my-project archive.json\n  \
+folder2json pack ./my-project - | xz > archive.json.xz\n  \
 folder2json pack ./src output.json -a -e target -e '*.log'\n  \
-folder2json pack ./daten archiv.json --no-compress --no-dedup"
+folder2json pack ./data archive.json --no-compress --no-dedup"
     )]
     Pack {
-        /// Quellordner, der gepackt werden soll
+        /// Source directory to pack
         #[arg(value_name = "SRC")]
         src: PathBuf,
 
-        /// Zielpfad für das JSON-Archiv oder '-' für direkte Stdout-Ausgabe
+        /// Destination path for the JSON archive, or '-' for stdout
         #[arg(value_name = "OUT")]
         out: String,
 
-        /// Versteckte Dateien und Ordner (.*) mit einbeziehen (standardmäßig ignoriert)
+        /// Include hidden files and hidden directories (.*) (ignored by default)
         #[arg(short = 'a', long = "all")]
         all: bool,
 
-        /// Ausschluss-Muster (wiederholbar, z. B. -e "*.log" -e ".git" -e "target")
+        /// Exclude patterns (can be repeated, e.g. -e "*.log" -e ".git" -e "target")
         #[arg(short = 'e', long = "exclude", value_name = "PATTERN")]
         exclude: Vec<String>,
 
-        /// Inhalts-Deduplizierung deaktivieren (Dateien werden dennoch gehasht)
+        /// Disable file deduplication (files are still hashed for integrity)
         #[arg(long = "no-dedup")]
         no_dedup: bool,
 
-        /// Zstandard-Kompression für Binärdateien deaktivieren (erzwingt reines Base64)
+        /// Disable Zstandard compression for binary files (forces plain base64)
         #[arg(long = "no-compress")]
         no_compress: bool,
 
-        /// Ausführliche Ausgabe aller verarbeiteten Dateien und Deduplizierungs-Links
+        /// Verbose output showing each processed entry and deduplication links
         #[arg(short = 'v', long = "verbose")]
         verbose: bool,
     },
 
-    /// Entpackt ein JSON-Archiv zurück in einen Ordner (nutze '-' für Stdin)
+    /// Unpack a JSON archive back into a folder (use '-' for stdin)
     #[command(
     name = "unpack",
-    about = "Stellt Verzeichnisbäume aus einem JSON-Archiv wieder her",
-    long_about = "Liest ein von folder2json erstelltes Archiv und stellt die Verzeichnisstruktur,\n\
-Dateiinhalte, POSIX-Rechte und Symlinks bitgenau wieder her.\n\
-Prüft 16-stellige SHA-256-Hashes vor dem Schreiben und erzwingt strenge Scope-Prüfungen\n\
-gegen Path-Traversal (../, ~/, /) und mehrstufige Symlink-Ketten-Escapes.\n\n\
-BEISPIELE:\n  \
-folder2json unpack archiv.json ./zielordner\n  \
-folder2json unpack archiv.json ./zielordner --force\n  \
-xz -dc archiv.json.xz | folder2json unpack - ./zielordner\n  \
-folder2json unpack archiv.json ./zielordner --no-verify --max-size-mib 1024"
+    about = "Restores directory trees from a JSON archive",
+    long_about = "Reads an archive created by folder2json and reconstructs directory hierarchy,\n\
+file contents, POSIX permissions, and symlinks bit-exactly.\n\
+Validates 16-character SHA-256 hashes prior to moving files into place and enforces\n\
+strict scope validation against path traversal (../, ~/, /) and chained symlink escapes.\n\n\
+EXAMPLES:\n  \
+folder2json unpack archive.json ./restored\n  \
+folder2json unpack archive.json ./restored --force\n  \
+xz -dc archive.json.xz | folder2json unpack - ./restored\n  \
+folder2json unpack archive.json ./restored --no-verify --max-size-mib 1024"
     )]
     Unpack {
-        /// Pfad zum JSON-Archiv oder '-' zum Einlesen über Stdin
+        /// Path to the JSON archive, or '-' to read from stdin
         #[arg(value_name = "IN_JSON")]
         in_json: String,
 
-        /// Zielverzeichnis, in das entpackt werden soll
+        /// Target directory where files should be extracted
         #[arg(value_name = "DST")]
         dst: PathBuf,
 
-        /// Bereits existierende Dateien im Zielordner überschreiben (standardmäßig geschützt)
+        /// Overwrite existing files in destination directory (protected by default)
         #[arg(short = 'f', long = "force")]
         force: bool,
 
-            /// SHA-256-Integritätsprüfungen überspringen (nur bei vertrauenswürdigen Quellen)
+            /// Skip SHA-256 cryptographic integrity verification (use with trusted archives only)
             #[arg(long = "no-verify")]
             no_verify: bool,
 
-            /// Erlaubt Symlinks, deren Ziel außerhalb des Zielordners liegt (standardmäßig blockiert)
+            /// Allow symlinks pointing outside the destination folder (blocked by default)
             #[arg(long = "allow-external-symlinks")]
             allow_external_symlinks: bool,
 
-            /// Maximal erlaubte entpackte Größe pro Datei in MiB (Schutz vor Dekompressionsbomben)
+            /// Maximum decompressed size per file in MiB (decompression bomb protection)
             #[arg(long = "max-size-mib", default_value_t = DEFAULT_MAX_SIZE_MIB, value_name = "MIB")]
             max_size_mib: u64,
 
-            /// Maximal erlaubte Gesamtgröße des Eingabe-JSON-Archivs in MiB
+            /// Maximum allowed size for the input JSON archive in MiB
             #[arg(long = "max-archive-mib", default_value_t = DEFAULT_MAX_ARCHIVE_MIB, value_name = "MIB")]
             max_archive_mib: u64,
 
-            /// Ausführliche Ausgabe aller entpackten und wiederhergestellten Dateien
+            /// Verbose output showing each extracted or linked file
             #[arg(short = 'v', long = "verbose")]
             verbose: bool,
     },
