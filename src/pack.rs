@@ -11,6 +11,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
+use std::io::{self, BufWriter, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
