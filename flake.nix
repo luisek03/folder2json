@@ -20,7 +20,7 @@
         # 1. Linux Binary
         linuxPkg = pkgs.rustPlatform.buildRustPackage {
           pname = "folder2json";
-          version = "1.2.0";
+          version = "1.2.1";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
@@ -33,7 +33,7 @@
         # 2. Windows Binary (.exe)
         windowsPkg = pkgsWindows.rustPlatform.buildRustPackage {
           pname = "folder2json-windows";
-          version = "1.2.0";
+          version = "1.2.1";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
